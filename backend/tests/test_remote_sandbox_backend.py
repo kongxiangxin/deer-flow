@@ -171,6 +171,11 @@ def test_create_delegates_to_provisioner_create(monkeypatch, expected_user_id):
 def test_provisioner_create_returns_sandbox_info(monkeypatch):
     backend = RemoteSandboxBackend("http://provisioner:8002")
     monkeypatch.setattr(remote_backend_mod, "user_should_see_legacy_skills", lambda user_id: True)
+    monkeypatch.setattr(
+        remote_backend_mod,
+        "get_app_config",
+        lambda: type("Config", (), {"sandbox": type("Sandbox", (), {"environment": {"PROJECT_ID": "111"}})()})(),
+    )
 
     def mock_post(url: str, json: dict, timeout: int):
         assert url == "http://provisioner:8002/api/sandboxes"
@@ -179,8 +184,9 @@ def test_provisioner_create_returns_sandbox_info(monkeypatch):
             "thread_id": "thread-1",
             "user_id": "test-user-autouse",
             "include_legacy_skills": True,
+            "environment": {"PROJECT_ID": "111"},
         }
-        assert timeout == 30
+        assert timeout == 90
         return _StubResponse(payload={"sandbox_id": "abc123", "sandbox_url": "http://k3s:31001"})
 
     monkeypatch.setattr(requests, "post", mock_post)
@@ -193,6 +199,11 @@ def test_provisioner_create_returns_sandbox_info(monkeypatch):
 def test_provisioner_create_accepts_anonymous_thread_id(monkeypatch):
     backend = RemoteSandboxBackend("http://provisioner:8002")
     monkeypatch.setattr(remote_backend_mod, "user_should_see_legacy_skills", lambda user_id: False)
+    monkeypatch.setattr(
+        remote_backend_mod,
+        "get_app_config",
+        lambda: type("Config", (), {"sandbox": type("Sandbox", (), {"environment": {}})()})(),
+    )
 
     def mock_post(url: str, json: dict, timeout: int):
         assert url == "http://provisioner:8002/api/sandboxes"
@@ -201,8 +212,9 @@ def test_provisioner_create_accepts_anonymous_thread_id(monkeypatch):
             "thread_id": None,
             "user_id": "test-user-autouse",
             "include_legacy_skills": False,
+            "environment": {},
         }
-        assert timeout == 30
+        assert timeout == 90
         return _StubResponse(payload={"sandbox_id": "anon123", "sandbox_url": "http://k3s:31002"})
 
     monkeypatch.setattr(requests, "post", mock_post)

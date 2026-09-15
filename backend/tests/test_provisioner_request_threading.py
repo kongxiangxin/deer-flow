@@ -32,6 +32,16 @@ class _RecordingCoreV1:
         self.created_pods: list[str] = []
         self.created_pod_specs: dict[str, object] = {}
         self.created_services: list[str] = []
+        self.deleted_pods: list[str] = []
+        self.pods: dict[str, object] = {
+            "sandbox-existing": SimpleNamespace(
+                metadata=SimpleNamespace(annotations={}),
+                status=SimpleNamespace(
+                    phase="Running",
+                    conditions=[SimpleNamespace(type="Ready", status="True")],
+                ),
+            )
+        }
 
     def _record_k8s_call(self) -> None:
         thread_id = threading.get_ident()
@@ -59,13 +69,24 @@ class _RecordingCoreV1:
 
     def read_namespaced_pod(self, _name: str, _namespace: str):
         self._record_k8s_call()
-        return SimpleNamespace(status=SimpleNamespace(phase="Running"))
+        sandbox_id = _name.removeprefix("sandbox-")
+        pod = self.pods.get(sandbox_id)
+        if pod is None:
+            raise ApiException(status=404)
+        return pod
 
     def create_namespaced_pod(self, _namespace: str, pod) -> None:
         self._record_k8s_call()
         sandbox_id = pod.metadata.labels["sandbox-id"]
         self.created_pods.append(sandbox_id)
         self.created_pod_specs[sandbox_id] = pod
+        self.pods[sandbox_id] = SimpleNamespace(
+            metadata=pod.metadata,
+            status=SimpleNamespace(
+                phase="Running",
+                conditions=[SimpleNamespace(type="Ready", status="True")],
+            ),
+        )
 
     def create_namespaced_service(self, _namespace: str, service) -> None:
         self._record_k8s_call()
@@ -78,6 +99,9 @@ class _RecordingCoreV1:
 
     def delete_namespaced_pod(self, _name: str, _namespace: str) -> None:
         self._record_k8s_call()
+        sandbox_id = _name.removeprefix("sandbox-")
+        self.deleted_pods.append(sandbox_id)
+        self.pods.pop(sandbox_id, None)
 
     def list_namespaced_service(self, _namespace: str, *, label_selector: str):
         self._record_k8s_call()
@@ -201,6 +225,71 @@ def test_create_sandbox_route_builds_expected_skills_mount_layout(
     mount_names = [mount.name for mount in pod.spec.containers[0].volume_mounts]
     assert volume_names == expected_mount_names
     assert mount_names == expected_mount_names
+
+
+def test_build_pod_injects_environment_without_renaming(provisioner_module) -> None:
+    environment = {"PROJECT_ID": "111", "CURRENT_ID": "222"}
+
+    pod = provisioner_module._build_pod(
+        "sandbox-env",
+        "thread-1",
+        environment=environment,
+    )
+
+    assert {item.name: item.value for item in pod.spec.containers[0].env} == environment
+    assert pod.metadata.annotations[provisioner_module.SANDBOX_ENV_HASH_ANNOTATION] == provisioner_module._environment_hash(environment)
+
+
+def test_create_sandbox_reuses_pod_when_environment_is_unchanged(monkeypatch, provisioner_module) -> None:
+    environment = {"PROJECT_ID": "111"}
+    fake_core_v1 = _RecordingCoreV1(event_loop_thread_id=-1)
+    fake_core_v1.pods["sandbox-existing"].metadata.annotations = {provisioner_module.SANDBOX_ENV_HASH_ANNOTATION: provisioner_module._environment_hash(environment)}
+    monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+
+    response = provisioner_module.create_sandbox(
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-existing",
+            thread_id="thread-1",
+            user_id="user-1",
+            environment=environment,
+        )
+    )
+
+    assert response.status == "Running"
+    assert fake_core_v1.deleted_pods == []
+    assert fake_core_v1.created_pods == []
+
+
+def test_create_sandbox_recreates_only_pod_when_environment_changes(monkeypatch, provisioner_module) -> None:
+    fake_core_v1 = _RecordingCoreV1(event_loop_thread_id=-1)
+    monkeypatch.setattr(provisioner_module, "core_v1", fake_core_v1)
+    monkeypatch.setattr(provisioner_module.time, "sleep", lambda _seconds: None)
+
+    response = provisioner_module.create_sandbox(
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-existing",
+            thread_id="thread-1",
+            user_id="user-1",
+            environment={"PROJECT_ID": "222"},
+        )
+    )
+
+    assert response.status == "Running"
+    assert fake_core_v1.deleted_pods == ["sandbox-existing"]
+    assert fake_core_v1.created_pods == ["sandbox-existing"]
+    assert fake_core_v1.created_services == []
+    pod = fake_core_v1.created_pod_specs["sandbox-existing"]
+    assert {item.name: item.value for item in pod.spec.containers[0].env} == {"PROJECT_ID": "222"}
+
+
+@pytest.mark.parametrize("invalid_name", ["1PROJECT", "PROJECT-ID", "PROJECT.ID"])
+def test_create_sandbox_rejects_invalid_environment_names(provisioner_module, invalid_name: str) -> None:
+    with pytest.raises(ValueError):
+        provisioner_module.CreateSandboxRequest(
+            sandbox_id="sandbox-env",
+            thread_id="thread-1",
+            environment={invalid_name: "value"},
+        )
 
 
 def test_create_sandbox_retries_transient_service_read_errors(monkeypatch: pytest.MonkeyPatch, provisioner_module) -> None:

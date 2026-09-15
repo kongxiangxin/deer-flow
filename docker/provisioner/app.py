@@ -29,6 +29,8 @@ Architecture (docker-compose-dev):
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -40,7 +42,7 @@ from fastapi import FastAPI, HTTPException
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # Suppress only the InsecureRequestWarning from urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,6 +79,10 @@ if SANDBOX_SERVICE_TYPE not in {"NodePort", "ClusterIP"}:
 SAFE_THREAD_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 SAFE_USER_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 DEFAULT_USER_ID = "default"
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_ENVIRONMENT_VARIABLES = 128
+MAX_ENVIRONMENT_BYTES = 16 * 1024
+SANDBOX_ENV_HASH_ANNOTATION = "deerflow.io/environment-hash"
 
 # Path to the kubeconfig *inside* the provisioner container.
 # Typically the host's ~/.kube/config is mounted here.
@@ -212,6 +218,20 @@ class CreateSandboxRequest(BaseModel):
     thread_id: str = Field(pattern=SAFE_THREAD_ID_PATTERN)
     user_id: str = Field(default=DEFAULT_USER_ID, pattern=SAFE_USER_ID_PATTERN)
     include_legacy_skills: bool = False
+    environment: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("environment")
+    @classmethod
+    def validate_environment(cls, environment: dict[str, str]) -> dict[str, str]:
+        if len(environment) > MAX_ENVIRONMENT_VARIABLES:
+            raise ValueError(f"environment exceeds {MAX_ENVIRONMENT_VARIABLES} entries")
+        for name in environment:
+            if not ENV_NAME_PATTERN.fullmatch(name):
+                raise ValueError(f"invalid environment variable name: {name!r}")
+        encoded_size = len(json.dumps(environment, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if encoded_size > MAX_ENVIRONMENT_BYTES:
+            raise ValueError(f"environment exceeds {MAX_ENVIRONMENT_BYTES} bytes")
+        return environment
 
 
 class SandboxResponse(BaseModel):
@@ -229,6 +249,11 @@ def _pod_name(sandbox_id: str) -> str:
 
 def _svc_name(sandbox_id: str) -> str:
     return f"sandbox-{sandbox_id}-svc"
+
+
+def _environment_hash(environment: dict[str, str]) -> str:
+    serialized = json.dumps(environment, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _sandbox_url(sandbox_id: str, node_port: int | None = None) -> str:
@@ -403,8 +428,10 @@ def _build_pod(
     user_id: str = DEFAULT_USER_ID,
     *,
     include_legacy_skills: bool = False,
+    environment: dict[str, str] | None = None,
 ) -> k8s_client.V1Pod:
     """Construct a Pod manifest for a single sandbox."""
+    environment = environment or {}
     return k8s_client.V1Pod(
         metadata=k8s_client.V1ObjectMeta(
             name=_pod_name(sandbox_id),
@@ -415,6 +442,7 @@ def _build_pod(
                 "app.kubernetes.io/name": "deer-flow",
                 "app.kubernetes.io/component": "sandbox",
             },
+            annotations={SANDBOX_ENV_HASH_ANNOTATION: _environment_hash(environment)},
         ),
         spec=k8s_client.V1PodSpec(
             containers=[
@@ -422,6 +450,7 @@ def _build_pod(
                     name="sandbox",
                     image=SANDBOX_IMAGE,
                     image_pull_policy="IfNotPresent",
+                    env=[k8s_client.V1EnvVar(name=name, value=value) for name, value in sorted(environment.items())],
                     ports=[
                         k8s_client.V1ContainerPort(
                             name="http",
@@ -552,6 +581,44 @@ def _get_pod_phase(sandbox_id: str) -> str:
         return "NotFound"
 
 
+def _read_pod(sandbox_id: str):
+    try:
+        return core_v1.read_namespaced_pod(_pod_name(sandbox_id), K8S_NAMESPACE)
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def _pod_environment_matches(pod, environment: dict[str, str]) -> bool:
+    annotations = pod.metadata.annotations or {}
+    existing_hash = annotations.get(SANDBOX_ENV_HASH_ANNOTATION)
+    if existing_hash is None and not environment:
+        return True
+    return existing_hash == _environment_hash(environment)
+
+
+def _pod_is_ready(pod) -> bool:
+    return any(condition.type == "Ready" and condition.status == "True" for condition in (pod.status.conditions or []))
+
+
+def _wait_for_pod_deleted(sandbox_id: str) -> bool:
+    for _ in range(20):
+        if _read_pod(sandbox_id) is None:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def _wait_for_pod_ready(sandbox_id: str) -> bool:
+    for _ in range(120):
+        pod = _read_pod(sandbox_id)
+        if pod is not None and _pod_is_ready(pod):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 # ── API endpoints ────────────────────────────────────────────────────────
 
 
@@ -572,6 +639,7 @@ def create_sandbox(req: CreateSandboxRequest):
     thread_id = req.thread_id
     user_id = req.user_id
     include_legacy_skills = req.include_legacy_skills
+    environment = req.environment
 
     logger.info(
         "Received request to create sandbox '%s' for thread '%s' user '%s' include_legacy_skills=%s",
@@ -583,12 +651,23 @@ def create_sandbox(req: CreateSandboxRequest):
 
     # ── Fast path: sandbox already exists ────────────────────────────
     existing_url = _sandbox_access_url(sandbox_id, tolerate_read_errors=True)
-    if existing_url:
+    existing_pod = _read_pod(sandbox_id)
+    if existing_url and existing_pod is not None and _pod_environment_matches(existing_pod, environment):
         return SandboxResponse(
             sandbox_id=sandbox_id,
             sandbox_url=existing_url,
             status=_get_pod_phase(sandbox_id),
         )
+
+    if existing_pod is not None and not _pod_environment_matches(existing_pod, environment):
+        try:
+            core_v1.delete_namespaced_pod(_pod_name(sandbox_id), K8S_NAMESPACE)
+            logger.info("Recreating Pod %s because its environment changed", _pod_name(sandbox_id))
+        except ApiException as exc:
+            if exc.status != 404:
+                raise HTTPException(status_code=500, detail=f"Pod deletion failed: {exc.reason}")
+        if not _wait_for_pod_deleted(sandbox_id):
+            raise HTTPException(status_code=500, detail="Existing Pod was not deleted in time")
 
     # ── Create Pod ───────────────────────────────────────────────────
     try:
@@ -599,6 +678,7 @@ def create_sandbox(req: CreateSandboxRequest):
                 thread_id,
                 user_id=user_id,
                 include_legacy_skills=include_legacy_skills,
+                environment=environment,
             ),
         )
         logger.info(f"Created Pod {_pod_name(sandbox_id)}")
@@ -606,18 +686,22 @@ def create_sandbox(req: CreateSandboxRequest):
         if exc.status != 409:  # 409 = AlreadyExists
             raise HTTPException(status_code=500, detail=f"Pod creation failed: {exc.reason}")
 
+    if not _wait_for_pod_ready(sandbox_id):
+        raise HTTPException(status_code=500, detail="Sandbox Pod was not ready in time")
+
     # ── Create Service ───────────────────────────────────────────────
-    try:
-        core_v1.create_namespaced_service(K8S_NAMESPACE, _build_service(sandbox_id))
-        logger.info(f"Created Service {_svc_name(sandbox_id)}")
-    except ApiException as exc:
-        if exc.status != 409:
-            # Roll back the Pod on failure
-            try:
-                core_v1.delete_namespaced_pod(_pod_name(sandbox_id), K8S_NAMESPACE)
-            except ApiException:
-                pass
-            raise HTTPException(status_code=500, detail=f"Service creation failed: {exc.reason}")
+    if existing_url is None:
+        try:
+            core_v1.create_namespaced_service(K8S_NAMESPACE, _build_service(sandbox_id))
+            logger.info(f"Created Service {_svc_name(sandbox_id)}")
+        except ApiException as exc:
+            if exc.status != 409:
+                # Roll back the Pod on failure
+                try:
+                    core_v1.delete_namespaced_pod(_pod_name(sandbox_id), K8S_NAMESPACE)
+                except ApiException:
+                    pass
+                raise HTTPException(status_code=500, detail=f"Service creation failed: {exc.reason}")
 
     # ── Wait until the Service has a usable access URL ───────────────
     sandbox_url: str | None = None

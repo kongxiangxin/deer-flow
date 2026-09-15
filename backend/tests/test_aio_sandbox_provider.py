@@ -374,6 +374,11 @@ def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
 
     monkeypatch.setattr(remote_mod.requests, "post", _post)
     monkeypatch.setattr(remote_mod, "user_should_see_legacy_skills", lambda user_id: True)
+    monkeypatch.setattr(
+        remote_mod,
+        "get_app_config",
+        lambda: SimpleNamespace(sandbox=SimpleNamespace(environment={"PROJECT_ID": "111"})),
+    )
 
     try:
         backend.create("thread-42", "sandbox-42")
@@ -386,6 +391,7 @@ def test_remote_backend_create_forwards_effective_user_id(monkeypatch):
         "thread_id": "thread-42",
         "user_id": "user-7",
         "include_legacy_skills": True,
+        "environment": {"PROJECT_ID": "111"},
     }
 
 
@@ -414,6 +420,25 @@ def test_remote_backend_create_prefers_explicit_user_id(monkeypatch):
 
     assert posted["json"]["user_id"] == "ou-user"
     assert posted["json"]["include_legacy_skills"] is False
+
+
+def test_cached_remote_sandbox_ensures_current_environment(tmp_path, monkeypatch):
+    """Each reuse asks the provisioner to apply this run's environment."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, _sandbox, info = _make_provider_with_active_sandbox(tmp_path, "sandbox-current-env")
+    provider._thread_sandboxes = {("default", "thread-current-env"): "sandbox-current-env"}
+    provider._backend = aio_mod.RemoteSandboxBackend("http://provisioner:8002")
+    monkeypatch.setattr(provider._backend, "is_alive", lambda _info: True)
+    ensured: list[tuple[str, str, str]] = []
+
+    def ensure_environment(thread_id, sandbox_id, *, user_id=None):
+        ensured.append((thread_id, sandbox_id, user_id))
+        return info
+
+    monkeypatch.setattr(provider._backend, "ensure_environment", ensure_environment)
+
+    assert provider._reuse_in_process_sandbox("thread-current-env", user_id="default") == "sandbox-current-env"
+    assert ensured == [("thread-current-env", "sandbox-current-env", "default")]
 
 
 # ── Sandbox client teardown (#2872) ──────────────────────────────────────────

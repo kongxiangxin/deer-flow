@@ -21,6 +21,7 @@ import logging
 
 import requests
 
+from deerflow.config import get_app_config
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.skills.storage import user_should_see_legacy_skills
 
@@ -101,6 +102,16 @@ class RemoteSandboxBackend(SandboxBackend):
         """
         return self._provisioner_list()
 
+    def ensure_environment(
+        self,
+        thread_id: str,
+        sandbox_id: str,
+        *,
+        user_id: str | None = None,
+    ) -> SandboxInfo:
+        """Ensure a reused remote sandbox has this run's environment."""
+        return self._provisioner_create(thread_id, sandbox_id, user_id=user_id)
+
     # ── Provisioner API calls ─────────────────────────────────────────────
 
     def _provisioner_list(self) -> list[SandboxInfo]:
@@ -147,6 +158,7 @@ class RemoteSandboxBackend(SandboxBackend):
         del extra_mounts
         effective_user_id = user_id or get_effective_user_id()
         include_legacy_skills = user_should_see_legacy_skills(effective_user_id)
+        environment = {str(key): str(value) for key, value in (get_app_config().sandbox.environment or {}).items()}
         try:
             resp = requests.post(
                 f"{self._provisioner_url}/api/sandboxes",
@@ -155,8 +167,9 @@ class RemoteSandboxBackend(SandboxBackend):
                     "thread_id": thread_id,
                     "user_id": effective_user_id,
                     "include_legacy_skills": include_legacy_skills,
+                    "environment": environment,
                 },
-                timeout=30,
+                timeout=90,
             )
             resp.raise_for_status()
             data = resp.json()

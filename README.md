@@ -345,6 +345,11 @@ DeerFlow supports multiple sandbox execution modes:
 - **Docker Execution** (runs sandbox code in isolated Docker containers)
 - **Docker Execution with Kubernetes** (runs sandbox code in Kubernetes pods via provisioner service)
 
+In provisioner mode, `sandbox.environment` is forwarded on each sandbox
+acquisition and injected into the Pod without renaming keys. If a retained Pod
+is reused with changed values, the provisioner recreates only that Pod while
+preserving its Service and persistent storage.
+
 For Docker development, service startup follows `config.yaml` sandbox mode. In Local/Docker modes, `provisioner` is not started.
 
 See the [Sandbox Configuration Guide](backend/docs/CONFIGURATION.md#sandbox) to configure your preferred mode.

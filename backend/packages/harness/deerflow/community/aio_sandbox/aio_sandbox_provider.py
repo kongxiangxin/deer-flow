@@ -498,6 +498,12 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
         """Return deterministic IDs for thread sandboxes and random IDs otherwise."""
         return self._deterministic_sandbox_id(thread_id, self._effective_acquire_user_id(user_id)) if thread_id else str(uuid.uuid4())[:8]
 
+    def _ensure_remote_environment(self, thread_id: str, info: SandboxInfo, *, user_id: str) -> SandboxInfo:
+        """Apply the current request environment when reusing a remote Pod."""
+        if isinstance(self._backend, RemoteSandboxBackend):
+            return self._backend.ensure_environment(thread_id, info.sandbox_id, user_id=user_id)
+        return info
+
     def _reuse_in_process_sandbox(self, thread_id: str | None, *, user_id: str | None = None, post_lock: bool = False) -> str | None:
         """Reuse an active in-process sandbox for a thread if one is still tracked."""
         if thread_id is None:
@@ -524,6 +530,9 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
                 expected_info=info,
             )
             return None
+
+        if info is not None:
+            info = self._ensure_remote_environment(thread_id, info, user_id=effective_user_id)
 
         with self._lock:
             if self._thread_sandboxes.get(key) != existing_id:
@@ -566,6 +575,8 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             )
             return None
 
+        info = self._ensure_remote_environment(thread_id, info, user_id=effective_user_id)
+
         with self._lock:
             warm_item = self._warm_pool.pop(sandbox_id, None)
             if warm_item is None:
@@ -592,6 +603,7 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
 
     def _register_discovered_sandbox(self, thread_id: str, info: SandboxInfo, *, user_id: str) -> str:
         """Track a sandbox discovered through the backend."""
+        info = self._ensure_remote_environment(thread_id, info, user_id=user_id)
         sandbox = AioSandbox(id=info.sandbox_id, base_url=info.sandbox_url)
         key = self._thread_key(thread_id, user_id)
         with self._lock:

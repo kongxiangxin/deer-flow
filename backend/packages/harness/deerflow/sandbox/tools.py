@@ -6,6 +6,7 @@ import posixpath
 import re
 import shlex
 from collections.abc import Callable
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from langchain.tools import tool
 
 from deerflow.agents.thread_state import ThreadDataState
 from deerflow.config import get_app_config
+from deerflow.config.app_config import pop_current_app_config, push_current_app_config
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
 from deerflow.constants import DEFAULT_SKILLS_CONTAINER_PATH
 from deerflow.runtime.secret_context import read_active_secrets
@@ -89,6 +91,24 @@ _LOCAL_BASH_ROOT_PATH_COMMANDS = {
     "tail",
     "tar",
 }
+
+
+@contextmanager
+def _runtime_app_config_context(runtime: Runtime):
+    """Restore request config when LangGraph invokes a tool in a fresh context."""
+    configurable = (runtime.config or {}).get("configurable", {})
+    app_config = configurable.get("app_config")
+    if app_config is None:
+        yield
+        return
+
+    push_current_app_config(app_config)
+    try:
+        yield
+    finally:
+        pop_current_app_config()
+
+
 _SHELL_COMMAND_SEPARATORS = {";", "&&", "||", "|", "|&", "&", "(", ")"}
 _SHELL_REDIRECTION_OPERATORS = {
     "<",
@@ -1371,8 +1391,9 @@ def ensure_sandbox_initialized(runtime: Runtime | None = None) -> Sandbox:
     if thread_id is None:
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
-    provider = get_sandbox_provider()
-    sandbox_id = provider.acquire(thread_id, user_id=resolve_runtime_user_id(runtime))
+    with _runtime_app_config_context(runtime):
+        provider = get_sandbox_provider()
+        sandbox_id = provider.acquire(thread_id, user_id=resolve_runtime_user_id(runtime))
 
     # Update runtime state - this persists across tool calls
     runtime.state["sandbox"] = {"sandbox_id": sandbox_id}
@@ -1416,8 +1437,9 @@ async def ensure_sandbox_initialized_async(runtime: Runtime | None = None) -> Sa
     if thread_id is None:
         raise SandboxRuntimeError("Thread ID not available in runtime context")
 
-    provider = get_sandbox_provider()
-    sandbox_id = await provider.acquire_async(thread_id, user_id=resolve_runtime_user_id(runtime))
+    with _runtime_app_config_context(runtime):
+        provider = get_sandbox_provider()
+        sandbox_id = await provider.acquire_async(thread_id, user_id=resolve_runtime_user_id(runtime))
 
     runtime.state["sandbox"] = {"sandbox_id": sandbox_id}
 
