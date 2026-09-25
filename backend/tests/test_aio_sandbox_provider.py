@@ -441,6 +441,23 @@ def test_cached_remote_sandbox_ensures_current_environment(tmp_path, monkeypatch
     assert ensured == [("thread-current-env", "sandbox-current-env", "default")]
 
 
+def test_cached_local_sandbox_with_changed_environment_is_destroyed(tmp_path, monkeypatch):
+    """A local container must be recreated because process env cannot change in place."""
+    aio_mod = importlib.import_module("deerflow.community.aio_sandbox.aio_sandbox_provider")
+    provider, _sandbox, _ = _make_provider_with_active_sandbox(tmp_path, "sandbox-stale-env")
+    info = provider._sandbox_infos["sandbox-stale-env"]
+    provider._thread_sandboxes = {("default", "thread-stale-env"): "sandbox-stale-env"}
+    provider._backend = SimpleNamespace(
+        is_alive=MagicMock(return_value=True),
+        has_current_environment=MagicMock(return_value=False),
+        destroy=MagicMock(),
+    )
+    monkeypatch.setattr(aio_mod, "LocalContainerBackend", type(provider._backend))
+
+    assert provider._reuse_in_process_sandbox("thread-stale-env", user_id="default") is None
+    provider._backend.destroy.assert_called_once_with(info)
+
+
 # ── Sandbox client teardown (#2872) ──────────────────────────────────────────
 
 

@@ -504,6 +504,11 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             return self._backend.ensure_environment(thread_id, info.sandbox_id, user_id=user_id)
         return info
 
+    def _local_environment_is_current(self, info: SandboxInfo) -> bool:
+        if isinstance(self._backend, LocalContainerBackend):
+            return self._backend.has_current_environment(info) is not False
+        return True
+
     def _reuse_in_process_sandbox(self, thread_id: str | None, *, user_id: str | None = None, post_lock: bool = False) -> str | None:
         """Reuse an active in-process sandbox for a thread if one is still tracked."""
         if thread_id is None:
@@ -527,6 +532,14 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             self._drop_unhealthy_sandbox(
                 existing_id,
                 "in-process cache failed health check",
+                expected_info=info,
+            )
+            return None
+
+        if info is not None and not self._local_environment_is_current(info):
+            self._drop_unhealthy_sandbox(
+                existing_id,
+                "sandbox environment changed",
                 expected_info=info,
             )
             return None
@@ -571,6 +584,14 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             self._drop_unhealthy_sandbox(
                 sandbox_id,
                 "warm-pool cache failed health check",
+                expected_info=info,
+            )
+            return None
+
+        if not self._local_environment_is_current(info):
+            self._drop_unhealthy_sandbox(
+                sandbox_id,
+                "sandbox environment changed",
                 expected_info=info,
             )
             return None
@@ -833,7 +854,10 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
                 # Backend discovery: another process may have created the container.
                 discovered = self._backend.discover(sandbox_id)
                 if discovered is not None:
-                    return self._register_discovered_sandbox(thread_id, discovered, user_id=effective_user_id)
+                    if not self._local_environment_is_current(discovered):
+                        self._backend.destroy(discovered)
+                    else:
+                        return self._register_discovered_sandbox(thread_id, discovered, user_id=effective_user_id)
 
                 return self._create_sandbox(thread_id, sandbox_id, user_id=effective_user_id)
             finally:
@@ -862,7 +886,10 @@ class AioSandboxProvider(WarmPoolLifecycleMixin[SandboxInfo], SandboxProvider):
             # Docker and perform a health check; keep it off the event loop.
             discovered = await asyncio.to_thread(self._backend.discover, sandbox_id)
             if discovered is not None:
-                return self._register_discovered_sandbox(thread_id, discovered, user_id=effective_user_id)
+                if not await asyncio.to_thread(self._local_environment_is_current, discovered):
+                    await asyncio.to_thread(self._backend.destroy, discovered)
+                else:
+                    return self._register_discovered_sandbox(thread_id, discovered, user_id=effective_user_id)
 
             return await self._create_sandbox_async(thread_id, sandbox_id, user_id=effective_user_id)
         finally:

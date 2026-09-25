@@ -6,6 +6,7 @@ Handles container lifecycle, port allocation, and cross-process container discov
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -19,6 +20,13 @@ from .backend import SandboxBackend, wait_for_sandbox_ready
 from .sandbox_info import SandboxInfo
 
 logger = logging.getLogger(__name__)
+
+SANDBOX_ENV_HASH_LABEL = "deerflow.io/environment-hash"
+
+
+def _environment_hash(environment: dict[str, str]) -> str:
+    payload = json.dumps(environment, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _parse_docker_timestamp(raw: str) -> float:
@@ -225,6 +233,47 @@ class LocalContainerBackend(SandboxBackend):
         self._environment = environment
         self._runtime = self._detect_runtime()
 
+    def _current_environment(self) -> dict[str, str]:
+        """Resolve environment from the request-scoped app config."""
+        try:
+            from deerflow.config import get_app_config
+
+            configured = get_app_config().sandbox.environment or {}
+        except Exception:
+            configured = self._environment
+
+        resolved: dict[str, str] = {}
+        for key, value in configured.items():
+            if isinstance(value, str) and value.startswith("$"):
+                resolved[str(key)] = os.environ.get(value[1:], "")
+            else:
+                resolved[str(key)] = str(value)
+        return resolved
+
+    def has_current_environment(self, info: SandboxInfo) -> bool | None:
+        """Return environment match status, or None when inspection is unavailable."""
+        target = info.container_id or info.container_name
+        if not target:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    self._runtime,
+                    "inspect",
+                    "-f",
+                    f'{{{{ index .Config.Labels "{SANDBOX_ENV_HASH_LABEL}" }}}}',
+                    target,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() == _environment_hash(self._current_environment())
+
     @property
     def runtime(self) -> str:
         """The detected container runtime ("docker" or "container")."""
@@ -284,6 +333,7 @@ class LocalContainerBackend(SandboxBackend):
         """
         del user_id
         container_name = f"{self._container_prefix}-{sandbox_id}"
+        environment = self._current_environment()
 
         # Retry loop: if Docker rejects the port (e.g. a stale container still
         # holds the binding after a process restart), skip that port and try the
@@ -296,7 +346,7 @@ class LocalContainerBackend(SandboxBackend):
         for _attempt in range(10):
             port = get_free_port(start_port=_next_start)
             try:
-                container_id = self._start_container(container_name, port, extra_mounts)
+                container_id = self._start_container(container_name, port, extra_mounts, environment=environment)
                 break
             except RuntimeError as exc:
                 release_port(port)
@@ -525,6 +575,8 @@ class LocalContainerBackend(SandboxBackend):
         container_name: str,
         port: int,
         extra_mounts: list[tuple[str, str, bool]] | None = None,
+        *,
+        environment: dict[str, str] | None = None,
     ) -> str:
         """Start a new container.
 
@@ -561,8 +613,11 @@ class LocalContainerBackend(SandboxBackend):
             ]
         )
 
+        environment = self._environment if environment is None else environment
+        cmd.extend(["--label", f"{SANDBOX_ENV_HASH_LABEL}={_environment_hash(environment)}"])
+
         # Environment variables
-        for key, value in self._environment.items():
+        for key, value in environment.items():
             cmd.extend(["-e", f"{key}={value}"])
 
         # Config-level volume mounts

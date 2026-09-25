@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from deerflow.community.aio_sandbox.local_backend import (
+    SANDBOX_ENV_HASH_LABEL,
     LocalContainerBackend,
+    _environment_hash,
     _format_container_command_for_log,
     _format_container_mount,
     _redact_container_command_for_log,
@@ -125,6 +127,56 @@ def test_start_container_logs_redacted_env_values(monkeypatch, caplog):
     assert "NORMAL=<redacted>" in log_output
     assert "secret-value" not in log_output
     assert "visible-value" not in log_output
+
+
+def test_start_container_uses_request_scoped_environment(monkeypatch):
+    backend = LocalContainerBackend(
+        image="sandbox:latest",
+        base_port=8080,
+        container_prefix="sandbox",
+        config_mounts=[],
+        environment={},
+    )
+    monkeypatch.setattr(backend, "_runtime", "docker")
+    monkeypatch.setattr(
+        "deerflow.config.get_app_config",
+        lambda: SimpleNamespace(sandbox=SimpleNamespace(environment={"PROJECT_ID": "111"})),
+    )
+    captured_cmd: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        return SimpleNamespace(stdout="container-id\n", stderr="", returncode=0)
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    environment = backend._current_environment()
+    backend._start_container("sandbox-test", 18080, environment=environment)
+
+    assert "PROJECT_ID=111" in captured_cmd
+    assert f"{SANDBOX_ENV_HASH_LABEL}={_environment_hash({'PROJECT_ID': '111'})}" in captured_cmd
+
+
+def test_has_current_environment_compares_container_label(monkeypatch):
+    backend = LocalContainerBackend(
+        image="sandbox:latest",
+        base_port=8080,
+        container_prefix="sandbox",
+        config_mounts=[],
+        environment={},
+    )
+    monkeypatch.setattr(backend, "_runtime", "docker")
+    monkeypatch.setattr(
+        "deerflow.config.get_app_config",
+        lambda: SimpleNamespace(sandbox=SimpleNamespace(environment={"PROJECT_ID": "111"})),
+    )
+    expected_hash = _environment_hash({"PROJECT_ID": "111"})
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=f"{expected_hash}\n", stderr="", returncode=0),
+    )
+
+    info = SimpleNamespace(container_id="container-id", container_name="sandbox-test")
+    assert backend.has_current_environment(info) is True
 
 
 def _capture_start_container_command(monkeypatch, backend: LocalContainerBackend, runtime: str = "docker") -> list[str]:

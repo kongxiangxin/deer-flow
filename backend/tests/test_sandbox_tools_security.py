@@ -20,6 +20,7 @@ from deerflow.sandbox.tools import (
     _resolve_and_validate_user_data_path,
     _resolve_skills_path,
     bash_tool,
+    ensure_sandbox_initialized_async,
     mask_local_paths_in_output,
     replace_virtual_path,
     replace_virtual_paths_in_command,
@@ -34,6 +35,38 @@ _THREAD_DATA = {
     "uploads_path": "/tmp/deer-flow/threads/t1/user-data/uploads",
     "outputs_path": "/tmp/deer-flow/threads/t1/user-data/outputs",
 }
+
+
+@pytest.mark.asyncio
+async def test_async_sandbox_acquire_restores_runtime_app_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lazy tool acquisition must carry request-scoped sandbox environment."""
+    from deerflow.config import get_app_config
+    from deerflow.config.app_config import peek_current_app_config
+
+    observed_environments: list[dict[str, str]] = []
+    sandbox = SimpleNamespace(id="sandbox-runtime-config")
+
+    class _Provider:
+        async def acquire_async(self, thread_id, *, user_id=None):
+            assert thread_id == "thread-runtime-config"
+            assert user_id == "user-runtime-config"
+            observed_environments.append(dict(get_app_config().sandbox.environment))
+            return sandbox.id
+
+        def get(self, sandbox_id):
+            return sandbox if sandbox_id == sandbox.id else None
+
+    runtime_app_config = SimpleNamespace(sandbox=SimpleNamespace(environment={"PROJECT_ID": "111"}))
+    runtime = SimpleNamespace(
+        state={},
+        context={"thread_id": "thread-runtime-config", "user_id": "user-runtime-config"},
+        config={"configurable": {"app_config": runtime_app_config}},
+    )
+    monkeypatch.setattr("deerflow.sandbox.tools.get_sandbox_provider", lambda: _Provider())
+
+    assert await ensure_sandbox_initialized_async(runtime) is sandbox
+    assert observed_environments == [{"PROJECT_ID": "111"}]
+    assert peek_current_app_config() is None
 
 
 # ---------- replace_virtual_path ----------

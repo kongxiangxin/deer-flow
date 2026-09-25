@@ -129,6 +129,9 @@ Regression tests related to Docker/provisioner behavior:
   endpoints as sync FastAPI handlers so synchronous K8s client calls run in the
   Starlette worker pool instead of on the ASGI event loop; also covers dynamic
   Pod environment injection and Pod-only recreation when values change)
+- `tests/test_sandbox_tools_security.py` covers restoration of request-scoped
+  `app_config` before lazy sandbox acquisition, including dynamic environment
+  values carried in LangGraph runtime config.
 
 Blocking-IO runtime gate (`tests/blocking_io/`):
 - Wraps every item under `tests/blocking_io/` with a strict Blockbuster
